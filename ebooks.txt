@@ -1,0 +1,10 @@
+1) How Linux Works
+2) Devops Automation Cookbook
+3) Automate Boring stuff with Python
+4) Ansible Configuration Management
+5) Learning Docker/Pro docker
+6) Puppet 4 essentials
+7) Oreily Python for Unix Admins
+8) Nginx HTTP server
+9) AWS system Administration
+10) CoreOS

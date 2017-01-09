@@ -1,0 +1,16 @@
+---
+- hosts: alpha
+  remote_user: continuum
+  sudo: yes
+
+  tasks:
+    - name: creating date variable
+      command: date +%Y%m%d%H%M%S
+      register: timestamp
+
+    - name: fetching files from remote machine
+      fetch: src=/pat/to/file/{{ item }} dest=/tmp/{{ inventory_hostname }}.{{ timestamp.stdout }} flat=yes
+      with_items:
+         - file1
+         - file2
+         - file3

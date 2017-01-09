@@ -1,0 +1,11 @@
+---
+- hosts: "{{ variable_host | default('alpha') }}"
+  remote_user: continuum
+  sudo: yes
+
+  tasks:
+    - name: Including Variable File
+      include_vars: vars/deletejobs.yml
+
+    - cron: name={{ item }} state=absent
+      with_items: "{{ deletejobs }}"

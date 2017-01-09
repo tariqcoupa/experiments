@@ -1,0 +1,10 @@
+---
+- hosts: 127.0.0.1
+  connection: local
+  tasks:
+            - name: Send notification message via Slack
+              local_action:
+                 module: slack
+                 token: T02FQQ490/B32D5CTHP/ZAn54fsjaQiRxYkG3SJg71xe
+                 msg: "this was sent using ansible" 
+                 channel: "#devops" 

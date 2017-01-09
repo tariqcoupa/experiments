@@ -1,0 +1,26 @@
+---
+- hosts: "{{ variable_host | default('alpha')}}"
+  remote_user: continuum
+  sudo: yes
+
+  vars_prompt:
+    - name: "mypass"
+      prompt: "Enter the number of days"
+ 
+  tasks:
+    - name: find files with above information
+      command: "find {{ item }}/replication -type d -mtime -{{ mypass }}"
+      with_items:
+        - /storage01
+        - /storage02
+        - /storage03
+        - /storage04
+        - /storage05
+        - /storage06
+        - /storage07
+        - /storage08
+        - /storage09
+      register: output
+
+    - name: printing file names
+      debug: var=output
