@@ -1,0 +1,15 @@
+---
+- hosts: "{{ variable_host | default('alpha')}}"
+  connection: local
+  tasks:
+  - name: Checking firewall status and sending slack notification
+    command: "/usr/sbin/ufw status"
+    register: output
+#  - name: Send notification message via Slack
+#    local_action:
+#      module: slack
+#      token: T02FQQ490/B32D5CTHP/ZAn54fsjaQiRxYkG3SJg71xe
+#      channel: "#devops"
+#      msg: "Status of firewall on host {{ ansible_hostname }} is {{ output.stdout_lines }}"
+  - name: Sending Email Notification
+    local_action: mail subject='Status of firewall on host {{ ansible_hostname }} is {{ output.stdout_lines }}'  

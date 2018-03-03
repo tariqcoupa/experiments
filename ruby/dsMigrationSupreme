@@ -1,0 +1,356 @@
+#!/usr/bin/env ruby
+# Move c247 Disk Safes between cloud SBMs
+# Copyright 2016 Continuum, LLC.
+# Authors:
+#	Alexander.vonGluck@r1soft.com
+
+
+require 'slack-notifier'
+require 'rmapi'
+require 'yaml'
+require 'pp'
+require 'json'
+require 'net/https'
+require 'net/ssh'
+require 'google/apis/sheets_v4'
+require 'googleauth'
+require 'googleauth/stores/file_token_store'
+
+require 'fileutils'
+
+OOB_URI = 'urn:ietf:wg:oauth:2.0:oob'
+APPLICATION_NAME = 'Google Sheets API Ruby Quickstart'
+CLIENT_SECRETS_PATH = 'client_secret.json'
+CREDENTIALS_PATH = File.join(Dir.home, '.credentials',
+                             "sheets.googleapis.com-ruby-quickstart.yaml")
+SCOPE = Google::Apis::SheetsV4::AUTH_SPREADSHEETS
+
+def authorize
+FileUtils.mkdir_p(File.dirname(CREDENTIALS_PATH))
+
+  client_id = Google::Auth::ClientId.from_file(CLIENT_SECRETS_PATH)
+  token_store = Google::Auth::Stores::FileTokenStore.new(file: CREDENTIALS_PATH)
+  authorizer = Google::Auth::UserAuthorizer.new(
+    client_id, SCOPE, token_store)
+  user_id = 'default'
+  credentials = authorizer.get_credentials(user_id)
+  if credentials.nil?
+    url = authorizer.get_authorization_url(
+      base_url: OOB_URI)
+    puts "Open the following URL in the browser and enter the " +
+         "resulting code after authorization"
+    puts url
+    code = gets
+    credentials = authorizer.get_and_store_credentials_from_code(
+      user_id: user_id, code: code, base_url: OOB_URI)
+  end
+  credentials
+end
+# Initialize the API
+service = Google::Apis::SheetsV4::SheetsService.new
+service.client_options.application_name = APPLICATION_NAME
+service.authorization = authorize
+
+
+
+if ARGV.count != 3
+  puts "Usage: dsMigrateSupreme <agentUUID> <source-SBM-UUID> <dest-SBM-UUID>"
+  exit 1
+end
+
+# check to see if user is running from inside a screen session. if not, exit.
+if !ENV['STY'] or ENV['STY'].empty?
+  puts "please run dsMigrationSupreme from a screen session."
+  exit 1
+end
+
+def Info(message)
+	@tail = message
+	puts "[\e[34mI\e[0m] #{message}"
+end
+
+def Error(message)
+	puts "[\e[31mE\e[0m] #{message}"
+end
+
+if !File.exist?(ENV['HOME']+'/.secrets.yml')
+	Error("Resource manager credentials missing! (~/.secrets.yml)")
+	exit 1
+end
+secrets = YAML.load_file(ENV['HOME']+'/.secrets.yml')
+
+@sudo = "echo '#{secrets[:password]}' | sudo -S -p ''"
+@sessionID = "migrate-#{rand(36**6).to_s(36)}"
+@notifier = Slack::Notifier.new("https://hooks.slack.com/services/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", channel: '#devops')
+@tail = "LAUNCH"
+
+def Notice(agent, message)
+	@notifier.ping "Agent '#{agent.name}' (ID:#{agent.id},Session:#{@sessionID})\n#{message}"
+end
+
+Info("Disk Safe Migration Supreme Edition")
+
+Info("Probing Agent information...")
+
+api = RMApi::Connection.new(secrets)
+
+@sourceCSBM = api.csbm.find(ARGV[1])
+@destCSBM = api.csbm.find(ARGV[2])
+  # TODO: We could autopick a destination CSBM based on utilization
+
+if @sourceCSBM.id == @destCSBM.id
+	# TODO: Maybe self-balance on a single CSBM someday?
+	Error("Source CSBM is the same as the destination CSBM!")
+	exit 1
+end
+
+if !@sourceCSBM
+	Error("Source CSBM '#{ARGV[1]}' is invalid!")
+	exit 1
+elsif !@destCSBM
+	Error("Destination CSBM '#{ARGV[2]}' is invalid!")
+	exit 1
+end
+
+@agent = api.agent.find(ARGV[0])
+if !@agent
+	Error("I couldn't find any record of #{ARGV[0]} in r1rm!")
+	exit 1
+end
+
+agent_csbm_ids = @agent.csbms.map(&:id)
+
+if !agent_csbm_ids or !agent_csbm_ids.include?(@sourceCSBM.id)
+	Error("'#{@agent.name}' doesn't exist on #{@sourceCSBM.hostname}! (He lives on #{agent_csbm_ids.join(",")})")
+	exit 1
+end
+
+Info("Attempting to move '#{@agent.name}' from #{@sourceCSBM.hostname} (#{@sourceCSBM.private_ip}) to #{@destCSBM.hostname} (#{@destCSBM.private_ip})")
+
+begin
+	sourceSSH = Net::SSH.start(@sourceCSBM.private_ip, secrets[:username], password: secrets[:password], keepalive: true, keepalive_interval: 10)
+	destSSH = Net::SSH.start(@destCSBM.private_ip, secrets[:username], password: secrets[:password], keepalive: true, keepalive_interval: 10)
+
+	dsSourceLocation = sourceSSH.exec!("getDiskSafe #{@agent.id}").split("\n").grep(/Disk Safe Path/).first.split(":")[1].strip
+	dsID = dsSourceLocation.split("/").last
+
+	if dsID.length != 36
+		# We want to be careful we don't mess with /storage/replication//
+		Error("dsID is invalid!")
+		exit 1
+	end
+
+	Info("#{@sourceCSBM.hostname} reports disk safe is located at '#{dsSourceLocation}'.")
+
+	dsDestLocation = destSSH.exec!("getStorageVolume").strip
+	dsAvailable = destSSH.exec!("df -B1").split("\n").grep(/#{dsDestLocation}/).first.squeeze(' ').strip.split(' ')[3].to_f / 1024.0 / 1024.0 / 1024.0
+
+	Info("#{@destCSBM.hostname} reports #{dsDestLocation} is nice this time of year.")
+
+	# TODO: Get this data from r1rm
+	#agentSpaceWants = (agent[:size].to_f / 1024.0 / 1024.0 / 1024.0) * 1.5
+
+	#if agentSpaceWants >= dsAvailable
+	#	Error("Best location on #{@destCSBM[:name]} only has #{dsAvailable} GiB available! (Disk safe wants #{agentSpaceWants} GiB)")
+	#	sourceSSH.close
+	#	destSSH.close
+	#	exit 1
+	#else
+	#	Info("If I fitz, I sitz. (Me Wantz: #{agentSpaceWants} GiB, You Haz: #{dsAvailable} GiB)")
+	#end
+
+	dsExists = false
+	dsExists = true if sourceSSH.exec!("#{@sudo} [ -d #{dsSourceLocation} ] && echo yes").strip == "yes"
+
+	if !dsExists
+		Error("Disk safe doesn't exist at documented position: '#{dsSourceLocation}'")
+		guessedPath = "/#{dsSourceLocation.strip.split('/')[1]}/replication_moved/#{dsID}"
+
+		if sourceSSH.exec!("#{@sudo} [ -d #{guessedPath} ] && echo yes").strip == "yes"
+			Info("FYI: Disk safe *does* exit however at: #{guessedPath}")
+		end
+
+		Error("Not sure what to do yet.. it looks like it was migrated away already from this node!")
+		sourceSSH.close
+		destSSH.close
+		exit 1
+	end
+
+	inFlight = false
+	inFlight = true if sourceSSH.exec!("#{@sudo} [ -f #{dsSourceLocation}/inFlight ] && echo yes").strip == "yes"
+
+	if inFlight
+		flightLog = sourceSSH.exec!("#{@sudo} cat #{dsSourceLocation}/inFlight").strip.split("\n")
+		Error("Disk safe at #{@sourceCSBM.hostname} (#{@sourceCSBM.private_ip}) is already in flight or was interrupted.")
+		Error("Flight log contains:")
+		flightLog.each do |line|
+			Error(" * #{line}")
+		end
+		print("[?] Do you wish to continue the migration? [y/n]: ")
+		prompt = STDIN.gets.chomp
+		exit 1 unless prompt == 'y'
+		# Erase inFlight check
+		sourceSSH.exec!("#{@sudo} rm -f #{dsSourceLocation}/inFlight")
+		Notice(@agent, "Resuming migration of #{@agent.id} from #{@sourceCSBM.hostname} to #{@destCSBM.hostname}...")
+	else
+		Notice(@agent, "Starting migration of #{@agent.id} from #{@sourceCSBM.hostname} to #{@destCSBM.hostname}...")
+	end
+
+	Info("Starting migration session #{@sessionID}")
+
+	Info("Generating one time SSH keys /tmp/#{@sessionID}...")
+	sourceSSH.exec!("ssh-keygen -f /tmp/#{@sessionID} -q -P ''")
+	key = sourceSSH.exec!("cat /tmp/#{@sessionID}.pub").strip
+
+	Info("Passing out one time SSH keys...")
+	destSSH.exec!("mkdir -p ~#{secrets[:username]}/.ssh")
+	destSSH.exec!("echo '#{key}' >> ~#{secrets[:username]}/.ssh/authorized_keys")
+	destSSH.exec!("chmod 600 ~#{secrets[:username]}/.ssh/authorized_keys")
+
+	dsXferPath = "#{dsDestLocation}/replication_import"
+	dsFinalPath = "#{dsDestLocation}/replication"
+
+	destSSH.exec!("#{@sudo} mkdir -p #{dsXferPath}")
+	destSSH.exec!("#{@sudo} mkdir -p #{dsFinalPath}")
+	destSSH.exec!("#{@sudo} chown -R continuum:continuum #{dsXferPath}")
+
+	dsSSHTarget = "continuum@#{@destCSBM.private_ip}:#{dsXferPath}"
+
+	Info("Triggering migration API...")
+	startMigration = sourceSSH.exec!("#{@sudo} startMigration -a #{@agent.id} &>> /tmp/#{@sessionID}.log ; echo $?").strip.to_i
+
+	if startMigration != 0 and !inFlight
+		Error("There was an error triggering the migration API. See #{@sourceCSBM.private_ip}:/tmp/#{@sessionID}.log for more info.")
+		print("[?] Do you wish to continue the migration? [y/n]: ")
+		prompt = STDIN.gets.chomp
+		exit 1 unless prompt == 'y'
+	else
+		Info("Migration started.")
+	end
+
+	# Now we're beyond the point of no return, start flight log
+
+	sourceSSH.exec!("#{@sudo} touch #{dsSourceLocation}/inFlight")
+	sourceSSH.exec!("#{@sudo} sh -c \"echo #{Time.now} - Migration session #{@sessionID} - detailed logs at /tmp/#{@sessionID}.log >> #{dsSourceLocation}/inFlight\"")
+	sourceSSH.exec!("#{@sudo} sh -c \"echo #{Time.now} - Starting migration from #{@sourceCSBM.id} to #{@destCSBM.id} >> #{dsSourceLocation}/inFlight\"")
+	sourceSSH.exec!("#{@sudo} sh -c \"echo #{Time.now} - Migration API triggered >> #{dsSourceLocation}/inFlight\"")
+	sourceSSH.exec!("#{@sudo} sh -c \"echo #{Time.now} - Destination is #{dsFinalPath}/#{dsID} >> #{dsSourceLocation}/inFlight\"")
+
+	if inFlight
+		sourceSSH.exec!("logger 'dsMigration (#{@sessionID}) RESUME migration of [agent:#{@agent.id}] from [csbm:#{@sourceCSBM.id}] to [csbm:#{@destCSBM.id}]'")
+	else
+		sourceSSH.exec!("logger 'dsMigration (#{@sessionID}) START migration of [agent:#{@agent.id}] from [csbm:#{@sourceCSBM.id}] to [csbm:#{@destCSBM.id}]'")
+	end
+
+	sourceSSH.exec!("#{@sudo} sh -c \"echo #{Time.now} - Starting transfer to #{dsSSHTarget}/#{dsID} >> #{dsSourceLocation}/inFlight\"")
+
+	Info("Starting copy to #{dsSSHTarget}/#{dsID}...")
+
+	# We close the destination SSH connection.  Chances of a disconnect over the entire copy process are high.
+	destSSH.close
+
+	rsync = "rsync --append-verify -arvzce 'ssh -T -i /tmp/#{@sessionID} -o StrictHostKeyChecking=no -o ServerAliveInterval=10 -o Compression=no'"
+	copyResult = sourceSSH.exec!("#{@sudo} #{rsync} #{dsSourceLocation} #{dsSSHTarget} &>> /tmp/#{@sessionID}.log && echo success").strip
+
+	# After copy, close source SSH connection
+	sourceSSH.close
+	if copyResult != "success"
+		Error("Copy reported a fault. Please see #{@sourceCSBM.private_ip}:/tmp/#{@sessionID}.log for more info.")
+		Notice(@agent, "Migration reported a fault in transfer. Please see #{@sourceCSBM.private_ip}:/tmp/#{@sessionID}.log for more info.")
+		exit 1
+	end
+
+	# Re-open SSH connections to help make everything more reliable
+	sourceSSH = Net::SSH.start(@sourceCSBM.private_ip, secrets[:username], password: secrets[:password], keepalive: true, keepalive_interval: 10)
+	destSSH = Net::SSH.start(@destCSBM.private_ip, secrets[:username], password: secrets[:password], keepalive: true, keepalive_interval: 10)
+
+	# Here we split off.  We tag source flight log with the last message, and continue in destination flight log
+	sourceSSH.exec!("#{@sudo} sh -c \"echo #{Time.now} - Copy success. Further logs on target machine #{@destCSBM.private_ip} >> #{dsSourceLocation}/inFlight\"")
+	destSSH.exec!("#{@sudo} sh -c \"echo #{Time.now} - Copy success. >> #{dsXferPath}/#{dsID}/inFlight\"")
+
+	Info("Erasing one time SSH keys...")
+	sourceSSH.exec!("rm /tmp/#{@sessionID}*")
+	destSSH.exec!("cp ~#{secrets[:username]}/.ssh/authorized_keys ~#{secrets[:username]}/.ssh/authorized_keys.old")
+	destSSH.exec!("grep -v '#{key}' ~#{secrets[:username]}/.ssh/authorized_keys.old > ~#{secrets[:username]}/.ssh/authorized_keys")
+
+	destSSH.exec!("#{@sudo} sh -c \"echo #{Time.now} - One time SSH keys erased. >> #{dsXferPath}/#{dsID}/inFlight\"")
+
+	# Move the disk safe to it's final resting place
+	Info("Tucking in the disk safe")
+	destSSH.exec!("#{@sudo} mv #{dsXferPath}/#{dsID} #{dsFinalPath}/")
+	destSSH.exec!("#{@sudo} chown -R root:root #{dsFinalPath}/#{dsID}")
+
+	destSSH.exec!("#{@sudo} sh -c \"echo #{Time.now} - Disk safe moved to final working path '#{dsFinalPath}' >> #{dsFinalPath}/#{dsID}/inFlight\"")
+
+	Info("Triggering import API")
+	finishedMigration = false
+	finishedMigration = true if destSSH.exec!("#{@sudo} importMigration -a #{@agent.id} -p #{dsFinalPath}/#{dsID} &>> /tmp/#{@sessionID}.log && echo success").strip == "success"
+
+	if !finishedMigration
+		Error("Unable to trigger import of disk safe through API. Please see #{@destCSBM.private_ip}:/tmp/#{@sessionID}.log for more info.")
+		sourceSSH.close
+		destSSH.close
+		exit 1
+	end
+
+	destSSH.exec!("#{@sudo} sh -c \"echo #{Time.now} - Disk safe imported via API success. >> #{dsFinalPath}/#{dsID}/inFlight\"")
+
+	# Move the flight log to it's final resting place
+	destSSH.exec!("#{@sudo} mv #{dsFinalPath}/#{dsID}/inFlight #{dsFinalPath}/#{dsID}/.migrationLog.#{Time.now.to_i}")
+
+	Info("Completing migration")
+
+	# Move old disk safe to replication_moved for safe keeping
+	sourceSSH.exec!("#{@sudo} mv #{dsSourceLocation}/inFlight #{dsSourceLocation}/.migrationLog.final")
+	sourceSSH.exec!("#{@sudo} mv #{dsSourceLocation} #{dsSourceLocation}/../../replication_moved/")
+
+	# *AFTER* we move the disk safe to the backup location, clean up the sbm reference to to
+	sourceSSH.exec!("#{@sudo} stopMigration -a #{@agent.id} -d")
+
+	destSSH.exec!("logger 'dsMigration (#{@sessionID}) COMPLETE migration of [agent:#{@agent.id}] from [csbm:#{@sourceCSBM.id}] to [csbm:#{@destCSBM.id}]'")
+
+	sourceSSH.close
+	destSSH.close
+rescue Exception => e
+	Error("Error executing remote commands: #{e.inspect}")
+	Notice(@agent, "Migration exception at stage '#{@tail}'\n#{e.inspect}")
+	exit 1
+end
+
+Notice(@agent, "Transfer was completed successfully.")
+
+if (@agent.replace_csbm(@sourceCSBM.id, @destCSBM.id) != true)
+  Notice(@agent, "Error attempting to update agent CSBM list!\nPlease execute 'Replace Agent CSBM' by hand!\n")
+end
+
+agent_new_csbm_ids = @agent.csbms.map(&:id)
+
+Info("Original CSBMS: #{agent_csbm_ids.join(',')}")
+Info("New CSBMS: #{agent_new_csbm_ids.join(',')}")
+
+Notice(@agent, "Migration of from #{@sourceCSBM.id} to #{@destCSBM.id} is complete!")
+
+@time = Time.now
+
+if finishedMigration
+	
+spreadsheet_id = '1JSjPUssOkvXaFgWk-UDysEcFInguxP5j4CIdWS0Yo2g'
+range = 'Sheet1!A:E'
+value_range_object = {
+        major_dimension: "ROWS",
+        values: [
+          [agent_csbm_ids, @sourceCSBM.hostname, @destCSBM.hostname, @time, "Success"]]
+ 
+}
+else
+	value_range_object = {
+        major_dimension: "ROWS",
+        values: [
+          [agent_csbm_ids, @sourceCSBM.hostname, @destCSBM.hostname, @time, "Failed"]]
+ 
+}
+response = service.append_spreadsheet_value(spreadsheet_id, range, valueInputOption=value_range_object, value_input_option: 'USER_ENTERED')
+puts ">>>>>>>>> Append response: #{response.inspect}"
+end
+
+Info("Entries written to Google SpreadSheet , All Hail Tariq!!!")

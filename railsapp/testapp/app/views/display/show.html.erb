@@ -1,0 +1,12 @@
+<h1>this is coming from show action</h1>
+<% @array.each do |x| %>
+	<h1><%= x %></h1>
+	<% end %>
+	<h2>Click below link to go back to index page</h2><br>
+	<%= link_to("This will take you to index page", {:action => 'index'}) %>
+
+	<%= link_to("This will take you to Second page", {:action => 'index', :page => 5, :id => 1}) %>
+
+	<br>
+	ID : <%= @id %> <br>
+	Page: <%= @page %>

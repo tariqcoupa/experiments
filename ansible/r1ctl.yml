@@ -1,0 +1,8 @@
+---
+- hosts: "{{ variable_host | default('alpha') }}"
+  remote_user: continuum
+  sudo: yes
+
+  tasks:
+    - name: Restarting R1ctl Every Week
+      cron: job="service r1ctl restart" weekday=0
